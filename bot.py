@@ -11,23 +11,18 @@ GDRE_APP_ID = "6981206a0d963bd020558212"
 BASE44_API = "https://app.base44.com/api/apps"
 BOT_ID = int(os.environ.get("BOT_ID", "1486587436409819196"))
 
-# D2C and above — allowed to trigger dashboard actions
 AUTHORIZED_ROLE_IDS = {
     1441285575918227537,  # GDRE | D2C 1-04
-    1441285206148644935,  # GDRE | D1C 1-03 (below D2C, excluded — just D2C+)
     1407167325341487214,  # GDRE - Executive Officer
     1132094992219902103,  # GDRE - Commanding Officer
     1405662068941783170,  # GDRE - Commanding Admiral
     1441284745299497050,  # GDRE | Directive Class (role)
 }
-# Remove D1C — only D2C and above
-AUTHORIZED_ROLE_IDS.discard(1441285206148644935)
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-# active_sessions: { channel_id: { user_id, history, username } }
 active_sessions = {}
 
 END_PHRASES = {"end", "stop", "bye", "goodbye", "quit", "exit", "close", "done"}
@@ -49,10 +44,10 @@ SYSTEM_PROMPT = (
     "You know about the clan's structure: Enlisted, Officer, Command, Overseer, Superintendent, Directive, and Ownership classes. "
     "Don't use markdown headers or bullet points unless asked. Be conversational.\n\n"
     "You can also perform dashboard actions like promoting or demoting personnel — but only for authorized users (D2C and above). "
-    "When a user asks to promote or demote someone, extract the target's name and the new rank/class, then return a JSON action like:\n"
+    "When a user asks to promote or demote someone, extract the target's name and the new rank/class, then return ONLY a JSON object like:\n"
     "{\"action\": \"promote\", \"target_name\": \"PlayerName\", \"new_rank_title\": \"RE | CDR 0-5\"}\n"
     "or {\"action\": \"demote\", \"target_name\": \"PlayerName\", \"new_rank_title\": \"RE | LT 0-3\"}\n"
-    "ONLY return the JSON if a dashboard action is needed. Otherwise just reply normally as text."
+    "ONLY return the raw JSON with no extra text if a dashboard action is needed. Otherwise just reply normally as text."
 )
 
 def is_authorized(member: discord.Member) -> bool:
@@ -74,24 +69,62 @@ async def ask_groq(history: list) -> str:
             data = await resp.json()
             return data["choices"][0]["message"]["content"]
 
-async def find_personnel(name: str) -> dict | None:
+async def find_personnel_fuzzy(name: str) -> dict | None:
+    """Fetch all personnel and find the closest name match (case-insensitive, partial)."""
     async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/filter"
-        async with session.post(url, json={"name": name}, headers={"Content-Type": "application/json"}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                records = data.get("records", [])
-                return records[0] if records else None
+        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/list"
+        async with session.post(url, json={}, headers={"Content-Type": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            records = data.get("records", [])
+
+    name_lower = name.lower()
+
+    # 1st pass: exact match (case-insensitive)
+    for r in records:
+        if r.get("name", "").lower() == name_lower:
+            return r
+
+    # 2nd pass: starts with
+    for r in records:
+        if r.get("name", "").lower().startswith(name_lower):
+            return r
+
+    # 3rd pass: contains
+    for r in records:
+        if name_lower in r.get("name", "").lower():
+            return r
+
     return None
 
-async def find_rank_by_title(title: str) -> dict | None:
+async def find_rank_fuzzy(title: str) -> dict | None:
+    """Fetch all ranks and find the closest title match (case-insensitive, partial)."""
     async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Rank/filter"
-        async with session.post(url, json={"title": title}, headers={"Content-Type": "application/json"}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                records = data.get("records", [])
-                return records[0] if records else None
+        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Rank/list"
+        async with session.post(url, json={}, headers={"Content-Type": "application/json"}) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            records = data.get("records", [])
+
+    title_lower = title.lower()
+
+    # 1st pass: exact match
+    for r in records:
+        if r.get("title", "").lower() == title_lower:
+            return r
+
+    # 2nd pass: starts with
+    for r in records:
+        if r.get("title", "").lower().startswith(title_lower):
+            return r
+
+    # 3rd pass: contains
+    for r in records:
+        if title_lower in r.get("title", "").lower():
+            return r
+
     return None
 
 async def update_personnel_rank(personnel_id: str, new_rank_id: str, new_class_id: str) -> bool:
@@ -100,7 +133,7 @@ async def update_personnel_rank(personnel_id: str, new_rank_id: str, new_class_i
         async with session.put(url, json={"current_rank_id": new_rank_id, "current_class_id": new_class_id}, headers={"Content-Type": "application/json"}) as resp:
             return resp.status == 200
 
-async def handle_dashboard_action(action_data: dict, authorized: bool, channel) -> str:
+async def handle_dashboard_action(action_data: dict, authorized: bool) -> str:
     if not authorized:
         return "🚫 You don't have permission to perform dashboard actions. D2C and above only."
 
@@ -111,19 +144,19 @@ async def handle_dashboard_action(action_data: dict, authorized: bool, channel) 
     if not target_name or not new_rank_title:
         return "I need both a name and a rank to do that. Try again with more detail."
 
-    personnel = await find_personnel(target_name)
+    personnel = await find_personnel_fuzzy(target_name)
     if not personnel:
-        return f"Couldn't find **{target_name}** in the dashboard. Double-check the name."
+        return f"Couldn't find anyone matching **{target_name}** in the dashboard."
 
-    new_rank = await find_rank_by_title(new_rank_title)
+    new_rank = await find_rank_fuzzy(new_rank_title)
     if not new_rank:
-        return f"Couldn't find rank **{new_rank_title}** in the dashboard. Check the rank title."
+        return f"Couldn't find a rank matching **{new_rank_title}** in the dashboard."
 
     success = await update_personnel_rank(personnel["id"], new_rank["id"], new_rank.get("class_id", ""))
 
     if success:
         verb = "promoted" if action == "promote" else "demoted"
-        return f"✅ **{target_name}** has been {verb} to **{new_rank_title}**."
+        return f"✅ **{personnel['name']}** has been {verb} to **{new_rank['title']}**."
     else:
         return f"⚠️ Something went wrong updating the dashboard. Try again."
 
@@ -187,10 +220,16 @@ async def on_message(message):
 
                 # Check if Groq returned a JSON action
                 stripped = reply.strip()
+                # Handle code block wrapping
+                if stripped.startswith("```"):
+                    stripped = stripped.strip("`").strip()
+                    if stripped.startswith("json"):
+                        stripped = stripped[4:].strip()
+
                 if stripped.startswith("{") and "action" in stripped:
                     try:
                         action_data = json.loads(stripped)
-                        result = await handle_dashboard_action(action_data, authorized, message.channel)
+                        result = await handle_dashboard_action(action_data, authorized)
                         session["history"].append({"role": "assistant", "content": result})
                         await message.channel.send(result)
                         return
