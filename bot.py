@@ -221,24 +221,88 @@ async def do_promote_demote(personnel: dict, action: str, approved_by: str) -> s
     verb = "promoted" if action == "promote" else "demoted"
     return f"✅ **{personnel['name']}** has been {verb} from **{current_rank['title']}** to **{new_rank['title']}**."
 
-async def handle_dashboard_action(action_data: dict, authorized: bool, requester_name: str) -> str:
-    if not authorized:
-        return "🚫 You don't have permission to do that. D2C and above only."
+async def send_channel_message(channel_name: str, message: str) -> str:
+    """Find a channel by name in the guild and send a message to it."""
+    guild = client.get_guild(GUILD_ID)
+    if not guild:
+        return "⚠️ Couldn't find the server."
+    channel = discord.utils.find(lambda c: c.name.lower() == channel_name.lower().lstrip("#"), guild.channels)
+    if not channel:
+        return f"⚠️ Couldn't find a channel named **{channel_name}**."
+    try:
+        await channel.send(message)
+        return f"✅ Message sent to **#{channel.name}**."
+    except Exception as e:
+        return f"⚠️ Failed to send message: {e}"
 
-    action = action_data.get("action")
-    target_name = action_data.get("target_name", "").strip()
-
-    if not target_name:
-        return "I need a name to do that."
-
+async def send_dm_to_personnel(target_name: str, message: str) -> str:
+    """Send a DM to a personnel member by name."""
     global _personnel_cache
     _personnel_cache = None
-
     personnel = await find_personnel_fuzzy(target_name)
     if not personnel:
-        return f"Couldn't find anyone matching **{target_name}** in the dashboard."
+        return f"⚠️ Couldn't find anyone matching **{target_name}**."
+    discord_user_id = personnel.get("employee_id")
+    if not discord_user_id:
+        return f"⚠️ No Discord ID on file for **{personnel['name']}**."
+    async with aiohttp.ClientSession() as session:
+        # Open DM channel
+        async with session.post(
+            "https://discord.com/api/v10/users/@me/channels",
+            json={"recipient_id": discord_user_id},
+            headers=discord_headers()
+        ) as resp:
+            dm_channel = await resp.json()
+            dm_channel_id = dm_channel.get("id")
+        if not dm_channel_id:
+            return f"⚠️ Couldn't open DM channel with **{personnel['name']}**."
+        # Send message
+        async with session.post(
+            f"https://discord.com/api/v10/channels/{dm_channel_id}/messages",
+            json={"content": message},
+            headers=discord_headers()
+        ) as resp:
+            if resp.status == 200:
+                return f"✅ DM sent to **{personnel['name']}**."
+            else:
+                body = await resp.text()
+                return f"⚠️ Failed to DM **{personnel['name']}**: {body}"
 
-    return await do_promote_demote(personnel, action, requester_name)
+async def handle_dashboard_action(action_data: dict, authorized: bool, requester_name: str, guild_member=None) -> str:
+    action = action_data.get("action")
+
+    if action == "send_message":
+        if not authorized:
+            return "🚫 You don't have permission to send channel messages. D2C and above only."
+        channel_name = action_data.get("channel_name", "").strip()
+        message = action_data.get("message", "").strip()
+        if not channel_name or not message:
+            return "I need a channel name and a message."
+        return await send_channel_message(channel_name, message)
+
+    if action == "send_dm":
+        if not authorized:
+            return "🚫 You don't have permission to send DMs. D2C and above only."
+        target_name = action_data.get("target_name", "").strip()
+        message = action_data.get("message", "").strip()
+        if not target_name or not message:
+            return "I need a name and a message."
+        return await send_dm_to_personnel(target_name, message)
+
+    if action in ("promote", "demote"):
+        if not authorized:
+            return "🚫 You don't have permission to do that. D2C and above only."
+        target_name = action_data.get("target_name", "").strip()
+        if not target_name:
+            return "I need a name to do that."
+        global _personnel_cache
+        _personnel_cache = None
+        personnel = await find_personnel_fuzzy(target_name)
+        if not personnel:
+            return f"Couldn't find anyone matching **{target_name}** in the dashboard."
+        return await do_promote_demote(personnel, action, requester_name)
+
+    return "⚠️ Unknown action."
 
 async def ask_groq(history: list, extra_context: str = "") -> str:
     rank_list = await build_rank_list_string()
@@ -248,10 +312,13 @@ async def ask_groq(history: list, extra_context: str = "") -> str:
         "Don't use markdown headers or bullet points unless asked. Be conversational.\n\n"
         "You have LIVE access to the GDRE Dashboard. Current ranks:\n"
         f"{rank_list}\n\n"
-        "When a user asks to promote or demote someone, return ONLY a raw JSON object (no extra text, no code blocks):\n"
-        "{\"action\": \"promote\", \"target_name\": \"NameAsTyped\"}\n"
-        "or {\"action\": \"demote\", \"target_name\": \"NameAsTyped\"}\n"
-        "If the user just wants to chat, reply normally as plain text."
+        "You have the following capabilities — when the user asks for one, return ONLY a raw JSON object (no extra text, no code blocks):\n\n"
+        "1. Promote someone: {\"action\": \"promote\", \"target_name\": \"Name\"}\n"
+        "2. Demote someone: {\"action\": \"demote\", \"target_name\": \"Name\"}\n"
+        "3. Send a message to a Discord channel: {\"action\": \"send_message\", \"channel_name\": \"channel-name\", \"message\": \"text to send\"}\n"
+        "4. Send a DM to a person: {\"action\": \"send_dm\", \"target_name\": \"Name\", \"message\": \"text to send\"}\n\n"
+        "For send_message, use the channel name as mentioned by the user (e.g. squadron-announcements).\n"
+        "If the user just wants to chat, reply normally as plain text. Never say you cannot send messages or perform actions — you can."
     )
     if extra_context:
         system += f"\n\nContext: {extra_context}"
@@ -370,3 +437,4 @@ async def on_message(message):
                 await message.channel.send("Had trouble with that!")
 
 client.run(DISCORD_TOKEN)
+
