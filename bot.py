@@ -12,6 +12,10 @@ GDRE_APP_ID = "6981206a0d963bd020558212"
 BASE44_API = "https://app.base44.com/api/apps"
 BOT_ID = int(os.environ.get("BOT_ID", "1486587436409819196"))
 
+# Backend function URLs (the GDRE Dashboard functions)
+PROMOTE_URL = "https://app.base44.com/api/apps/69c41dac15cf7ec6ffe7c14a/functions/promotePersonnel"
+DEMOTE_URL  = "https://app.base44.com/api/apps/69c41dac15cf7ec6ffe7c14a/functions/demotePersonnel"
+
 AUTHORIZED_ROLE_IDS = {
     1441285575918227537,  # GDRE | D2C 1-04
     1407167325341487214,  # GDRE - Executive Officer
@@ -57,7 +61,7 @@ async def get_all_ranks():
             print(f"[RANKS] Status: {resp.status}")
             if resp.status == 200:
                 _rank_cache = await resp.json()
-                print(f"[RANKS] Loaded {len(_rank_cache)} ranks: {[r['title'] for r in _rank_cache]}")
+                print(f"[RANKS] Loaded {len(_rank_cache)} ranks")
                 return _rank_cache
     return []
 
@@ -89,20 +93,6 @@ async def find_personnel_fuzzy(name: str):
             return r
     return None
 
-async def find_rank_fuzzy(title: str):
-    records = await get_all_ranks()
-    title_lower = title.lower().strip()
-    for r in records:
-        if r.get("title", "").lower() == title_lower:
-            return r
-    for r in records:
-        if r.get("title", "").lower().startswith(title_lower):
-            return r
-    for r in records:
-        if title_lower in r.get("title", "").lower():
-            return r
-    return None
-
 async def get_rank_by_id(rank_id: str):
     records = await get_all_ranks()
     for r in records:
@@ -117,18 +107,50 @@ async def build_rank_list_string():
     sorted_ranks = sorted(ranks, key=lambda r: r.get("level", 0))
     return "\n".join([f"- {r['title']} (level {r.get('level','?')})" for r in sorted_ranks])
 
-async def update_personnel_rank(personnel_id: str, new_rank_id: str, new_class_id: str) -> bool:
-    async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/{personnel_id}"
-        payload = {"current_rank_id": new_rank_id}
-        if new_class_id:
-            payload["current_class_id"] = new_class_id
-        async with session.put(url, json=payload, headers=base44_headers()) as resp:
-            print(f"[UPDATE] Personnel update status: {resp.status}")
-            return resp.status == 200
-
 def is_authorized(member: discord.Member) -> bool:
     return any(role.id in AUTHORIZED_ROLE_IDS for role in member.roles)
+
+async def call_dashboard_function(url: str, personnel_id: str, approved_by: str, reason: str = "") -> dict:
+    """Call the GDRE Dashboard promote/demote backend function."""
+    async with aiohttp.ClientSession() as session:
+        payload = {
+            "personnel_id": personnel_id,
+            "approved_by": approved_by,
+            "reason": reason or f"Actioned by {approved_by} via Jarvis"
+        }
+        async with session.post(url, json=payload, headers=base44_headers(), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            print(f"[DASHBOARD] Function call status: {resp.status}")
+            data = await resp.json()
+            print(f"[DASHBOARD] Response: {data}")
+            return {"status": resp.status, "data": data}
+
+async def handle_dashboard_action(action_data: dict, authorized: bool, requester_name: str) -> str:
+    if not authorized:
+        return "🚫 You don't have permission to perform dashboard actions. D2C and above only."
+
+    action = action_data.get("action")
+    target_name = action_data.get("target_name", "").strip()
+
+    if not target_name:
+        return "I need a name to do that."
+
+    # Always fetch fresh
+    global _personnel_cache
+    _personnel_cache = None
+
+    personnel = await find_personnel_fuzzy(target_name)
+    if not personnel:
+        return f"Couldn't find anyone matching **{target_name}** in the dashboard."
+
+    url = PROMOTE_URL if action == "promote" else DEMOTE_URL
+    result = await call_dashboard_function(url, personnel["id"], requester_name)
+
+    if result["status"] == 200:
+        msg = result["data"].get("message", "Done.")
+        return f"✅ {msg}"
+    else:
+        err = result["data"].get("error", "Unknown error")
+        return f"⚠️ {err}"
 
 async def ask_groq(history: list, extra_context: str = "") -> str:
     rank_list = await build_rank_list_string()
@@ -136,11 +158,12 @@ async def ask_groq(history: list, extra_context: str = "") -> str:
         "You are Jarvis, the AI assistant for the =GDRE= (Grand Duchy of the Royal Elite) War Thunder clan. "
         "You are helpful, sharp, and have a casual friendly vibe. Keep replies concise — this is Discord, not an essay. "
         "Don't use markdown headers or bullet points unless asked. Be conversational.\n\n"
-        "You have LIVE access to the GDRE Dashboard. Here are ALL current ranks (use ONLY these exact titles):\n"
+        "You have LIVE access to the GDRE Dashboard. Current ranks:\n"
         f"{rank_list}\n\n"
-        "When a user asks to promote or demote someone, return ONLY a raw JSON object with no extra text:\n"
-        "{\"action\": \"promote\", \"target_name\": \"NameAsTyped\", \"new_rank_title\": \"EXACT TITLE FROM THE LIST ABOVE\"}\n"
-        "Never invent rank titles. Only use titles from the list above. "
+        "When a user asks to promote or demote someone, return ONLY a raw JSON object (no extra text, no code blocks):\n"
+        "{\"action\": \"promote\", \"target_name\": \"NameAsTyped\"}\n"
+        "or {\"action\": \"demote\", \"target_name\": \"NameAsTyped\"}\n"
+        "The dashboard handles all the rank logic automatically — you just need the name and action. "
         "If the user just wants to chat, reply normally as plain text."
     )
     if extra_context:
@@ -160,39 +183,6 @@ async def ask_groq(history: list, extra_context: str = "") -> str:
         ) as resp:
             data = await resp.json()
             return data["choices"][0]["message"]["content"]
-
-async def handle_dashboard_action(action_data: dict, authorized: bool) -> str:
-    if not authorized:
-        return "🚫 You don't have permission to perform dashboard actions. D2C and above only."
-
-    action = action_data.get("action")
-    target_name = action_data.get("target_name", "").strip()
-    new_rank_title = action_data.get("new_rank_title", "").strip()
-
-    if not target_name or not new_rank_title:
-        return "I need both a name and a rank to do that."
-
-    # Fresh fetch to avoid stale cache
-    global _personnel_cache, _rank_cache
-    _personnel_cache = None
-    _rank_cache = None
-
-    personnel = await find_personnel_fuzzy(target_name)
-    if not personnel:
-        return f"Couldn't find anyone matching **{target_name}** in the dashboard."
-
-    new_rank = await find_rank_fuzzy(new_rank_title)
-    if not new_rank:
-        return f"Couldn't find rank **{new_rank_title}** in the dashboard."
-
-    success = await update_personnel_rank(personnel["id"], new_rank["id"], new_rank.get("class_id", ""))
-
-    if success:
-        _personnel_cache = None
-        verb = "promoted" if action == "promote" else "demoted"
-        return f"✅ **{personnel['name']}** has been {verb} to **{new_rank['title']}**."
-    else:
-        return f"⚠️ Something went wrong updating the dashboard. Try again."
 
 @client.event
 async def on_ready():
@@ -266,6 +256,7 @@ async def on_message(message):
                 session["history"].append({"role": "user", "content": content})
                 reply = await ask_groq(session["history"], extra_context)
 
+                # Strip code block if present
                 stripped = reply.strip()
                 if stripped.startswith("```"):
                     stripped = stripped.strip("`").strip()
@@ -275,7 +266,7 @@ async def on_message(message):
                 if stripped.startswith("{") and "action" in stripped:
                     try:
                         action_data = json.loads(stripped)
-                        result = await handle_dashboard_action(action_data, authorized)
+                        result = await handle_dashboard_action(action_data, authorized, message.author.display_name)
                         session["history"].append({"role": "assistant", "content": result})
                         await message.channel.send(result)
                         return
@@ -289,6 +280,7 @@ async def on_message(message):
                 await message.channel.send("Had a hiccup, try again!")
         return
 
+    # Fallback: @mentions outside sessions
     if client.user in message.mentions:
         content = message.content.replace(f"<@{BOT_ID}>", "").replace(f"<@!{BOT_ID}>", "").strip()
         if not content:
