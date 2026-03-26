@@ -4,14 +4,20 @@ import os
 import aiohttp
 import traceback
 import json
+import datetime
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 BASE44_API_KEY = os.environ["BASE44_API_KEY"]
 GDRE_APP_ID = "6981206a0d963bd020558212"
-JARVIS_APP_ID = "69c41dac15cf7ec6ffe7c14a"
 BASE44_API = "https://app.base44.com/api/apps"
 BOT_ID = int(os.environ.get("BOT_ID", "1486587436409819196"))
+GUILD_ID = int(os.environ.get("GUILD_ID", "1132094992219902100"))
+
+PROMOTION_CHANNEL_ID = "1407185599378493451"
+DEMOTION_CHANNEL_ID  = "1407185671621185566"
+PROMOTION_FORMAT = "{uname}\nNew rank: {newrank}\nOld rank: {oldrank}"
+DEMOTION_FORMAT  = "{uname}\nNew rank: {newrank}\nOld rank: {oldrank}"
 
 AUTHORIZED_ROLE_IDS = {
     1441285575918227537,
@@ -44,6 +50,9 @@ client = MyClient()
 
 def base44_headers():
     return {"Content-Type": "application/json", "x-api-key": BASE44_API_KEY}
+
+def discord_headers():
+    return {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
 
 async def get_all_ranks():
     global _rank_cache
@@ -102,8 +111,43 @@ async def build_rank_list_string():
 def is_authorized(member: discord.Member) -> bool:
     return any(role.id in AUTHORIZED_ROLE_IDS for role in member.roles)
 
+async def send_discord_role_update(user_id: str, old_role_id: str, new_role_id: str):
+    """Remove old rank role and add new rank role on the guild member."""
+    async with aiohttp.ClientSession() as session:
+        # Remove old role
+        if old_role_id:
+            url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{user_id}/roles/{old_role_id}"
+            async with session.delete(url, headers=discord_headers()) as resp:
+                print(f"[ROLE] Remove old role {old_role_id}: {resp.status}")
+
+        # Add new role
+        if new_role_id:
+            url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{user_id}/roles/{new_role_id}"
+            async with session.put(url, headers=discord_headers()) as resp:
+                print(f"[ROLE] Add new role {new_role_id}: {resp.status}")
+
+async def send_announcement(action: str, discord_user_id: str, old_rank: dict, new_rank: dict):
+    """Post announcement to the promotions or demotions channel."""
+    channel_id = PROMOTION_CHANNEL_ID if action == "promote" else DEMOTION_CHANNEL_ID
+    fmt = PROMOTION_FORMAT if action == "promote" else DEMOTION_FORMAT
+
+    uname = f"<@{discord_user_id}>"
+    oldrank = f"<@&{old_rank['discord_role_id']}>" if old_rank.get("discord_role_id") else old_rank.get("title", "Unknown")
+    newrank = f"<@&{new_rank['discord_role_id']}>" if new_rank.get("discord_role_id") else new_rank.get("title", "Unknown")
+
+    message = fmt.replace("{uname}", uname).replace("{newrank}", newrank).replace("{oldrank}", oldrank)
+
+    async with aiohttp.ClientSession() as session:
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        async with session.post(url, json={"content": message}, headers=discord_headers()) as resp:
+            print(f"[ANNOUNCE] Posted to channel {channel_id}: {resp.status}")
+            body = await resp.text()
+            print(f"[ANNOUNCE] Response: {body}")
+
 async def do_promote_demote(personnel: dict, action: str, approved_by: str) -> str:
-    """Directly perform the promote/demote logic against the Base44 API."""
+    """Perform the full promote/demote: update rank, create RankChange, update roles, post announcement."""
+    global _rank_cache, _personnel_cache
+
     ranks = await get_all_ranks()
     if not ranks:
         return "⚠️ Couldn't load ranks from dashboard."
@@ -117,33 +161,30 @@ async def do_promote_demote(personnel: dict, action: str, approved_by: str) -> s
     current_class = current_rank.get("class_id", "")
 
     if action == "promote":
-        # Find next rank: same class first, then any class
-        next_rank = next((r for r in ranks_sorted if r.get("level", 0) == current_level + 1 and r.get("class_id") == current_class), None)
-        if not next_rank:
-            next_rank = next((r for r in ranks_sorted if r.get("level", 0) == current_level + 1), None)
-        if not next_rank:
+        new_rank = next((r for r in ranks_sorted if r.get("level") == current_level + 1 and r.get("class_id") == current_class), None)
+        if not new_rank:
+            new_rank = next((r for r in ranks_sorted if r.get("level") == current_level + 1), None)
+        if not new_rank:
             return f"⚠️ **{personnel['name']}** is already at the highest rank."
-        new_rank = next_rank
     else:
-        # Find previous rank
-        prev_rank = next((r for r in reversed(ranks_sorted) if r.get("level", 0) == current_level - 1 and r.get("class_id") == current_class), None)
-        if not prev_rank:
-            prev_rank = next((r for r in reversed(ranks_sorted) if r.get("level", 0) == current_level - 1), None)
-        if not prev_rank:
+        new_rank = next((r for r in reversed(ranks_sorted) if r.get("level") == current_level - 1 and r.get("class_id") == current_class), None)
+        if not new_rank:
+            new_rank = next((r for r in reversed(ranks_sorted) if r.get("level") == current_level - 1), None)
+        if not new_rank:
             return f"⚠️ **{personnel['name']}** is already at the lowest rank."
-        new_rank = prev_rank
 
-    # Update personnel rank
+    # 1. Update Personnel record
     async with aiohttp.ClientSession() as session:
         url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/{personnel['id']}"
-        payload = {"current_rank_id": new_rank["id"], "current_class_id": new_rank.get("class_id", personnel.get("current_class_id", ""))}
+        payload = {
+            "current_rank_id": new_rank["id"],
+            "current_class_id": new_rank.get("class_id", personnel.get("current_class_id", ""))
+        }
         async with session.put(url, json=payload, headers=base44_headers()) as resp:
             if resp.status != 200:
-                body = await resp.text()
-                print(f"[UPDATE] Failed: {resp.status} {body}")
                 return f"⚠️ Failed to update rank in dashboard."
 
-    # Create RankChange record
+    # 2. Create RankChange record
     async with aiohttp.ClientSession() as session:
         url = f"{BASE44_API}/{GDRE_APP_ID}/entities/RankChange"
         payload = {
@@ -154,14 +195,27 @@ async def do_promote_demote(personnel: dict, action: str, approved_by: str) -> s
             "new_class_id": new_rank.get("class_id", ""),
             "change_type": action,
             "reason": f"{'Promoted' if action == 'promote' else 'Demoted'} by {approved_by} via Jarvis",
-            "effective_date": __import__('datetime').date.today().isoformat(),
+            "effective_date": datetime.date.today().isoformat(),
             "approved_by": approved_by,
         }
         async with session.post(url, json=payload, headers=base44_headers()) as resp:
-            print(f"[RANKCHANGE] Create status: {resp.status}")
+            print(f"[RANKCHANGE] {resp.status}")
+
+    # 3. Update Discord roles
+    discord_user_id = personnel.get("employee_id") or personnel.get("discord_user_id")
+    if discord_user_id:
+        await send_discord_role_update(
+            discord_user_id,
+            current_rank.get("discord_role_id", ""),
+            new_rank.get("discord_role_id", "")
+        )
+
+        # 4. Post announcement to channel
+        await send_announcement(action, discord_user_id, current_rank, new_rank)
+    else:
+        print(f"[WARN] No discord_user_id for {personnel['name']}, skipping role update and announcement")
 
     # Invalidate cache
-    global _personnel_cache
     _personnel_cache = None
 
     verb = "promoted" if action == "promote" else "demoted"
