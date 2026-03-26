@@ -222,18 +222,35 @@ async def do_promote_demote(personnel: dict, action: str, approved_by: str) -> s
     return f"✅ **{personnel['name']}** has been {verb} from **{current_rank['title']}** to **{new_rank['title']}**."
 
 async def send_channel_message(channel_name: str, message: str) -> str:
-    """Find a channel by name in the guild and send a message to it."""
+    """Find a channel by ID or name in the guild and send a message to it."""
     guild = client.get_guild(GUILD_ID)
     if not guild:
         return "⚠️ Couldn't find the server."
-    channel = discord.utils.find(lambda c: c.name.lower() == channel_name.lower().lstrip("#"), guild.channels)
+    
+    # Strip leading # and whitespace
+    cleaned = channel_name.strip().lstrip("#").strip()
+    
+    # Try by ID first (Discord mentions pass channel IDs)
+    channel = None
+    if cleaned.isdigit():
+        channel = guild.get_channel(int(cleaned))
+    
+    # Try by exact name
     if not channel:
-        return f"⚠️ Couldn't find a channel named **{channel_name}**."
+        channel = discord.utils.find(lambda c: c.name.lower() == cleaned.lower(), guild.channels)
+    
+    # Try partial name match
+    if not channel:
+        channel = discord.utils.find(lambda c: cleaned.lower() in c.name.lower(), guild.channels)
+    
+    if not channel:
+        available = ", ".join([f"#{c.name}" for c in guild.text_channels[:10]])
+        return f"⚠️ Couldn't find a channel named **{cleaned}**. Available: {available}"
     try:
         await channel.send(message)
         return f"✅ Message sent to **#{channel.name}**."
     except Exception as e:
-        return f"⚠️ Failed to send message: {e}"
+        return f"⚠️ Failed to send to **#{channel.name}**: {e}"
 
 async def send_dm_to_personnel(target_name: str, message: str) -> str:
     """Send a DM to a personnel member by name."""
@@ -317,7 +334,7 @@ async def ask_groq(history: list, extra_context: str = "") -> str:
         "2. Demote someone: {\"action\": \"demote\", \"target_name\": \"Name\"}\n"
         "3. Send a message to a Discord channel: {\"action\": \"send_message\", \"channel_name\": \"channel-name\", \"message\": \"text to send\"}\n"
         "4. Send a DM to a person: {\"action\": \"send_dm\", \"target_name\": \"Name\", \"message\": \"text to send\"}\n\n"
-        "For send_message, use the channel name as mentioned by the user (e.g. squadron-announcements).\n"
+        "For send_message, use the channel_name exactly as the user typed it — if they used a #channel mention, pass the raw channel ID number you see in the text.\n"
         "If the user just wants to chat, reply normally as plain text. Never say you cannot send messages or perform actions — you can."
     )
     if extra_context:
@@ -437,4 +454,5 @@ async def on_message(message):
                 await message.channel.send("Had trouble with that!")
 
 client.run(DISCORD_TOKEN)
+
 
