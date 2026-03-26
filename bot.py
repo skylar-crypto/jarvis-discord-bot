@@ -7,6 +7,7 @@ import json
 
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+BASE44_API_KEY = os.environ["BASE44_API_KEY"]
 GDRE_APP_ID = "6981206a0d963bd020558212"
 BASE44_API = "https://app.base44.com/api/apps"
 BOT_ID = int(os.environ.get("BOT_ID", "1486587436409819196"))
@@ -24,8 +25,11 @@ intents.message_content = True
 intents.members = True
 
 active_sessions = {}
-
 END_PHRASES = {"end", "stop", "bye", "goodbye", "quit", "exit", "close", "done"}
+
+# Cache ranks and personnel to avoid repeated API calls
+_rank_cache = None
+_personnel_cache = None
 
 class MyClient(discord.Client):
     def __init__(self):
@@ -38,100 +42,131 @@ class MyClient(discord.Client):
 
 client = MyClient()
 
-SYSTEM_PROMPT = (
-    "You are Jarvis, the AI assistant for the =GDRE= (Grand Duchy of the Royal Elite) War Thunder clan. "
-    "You are helpful, sharp, and have a casual friendly vibe. Keep replies concise — this is Discord, not an essay. "
-    "You know about the clan's structure: Enlisted, Officer, Command, Overseer, Superintendent, Directive, and Ownership classes. "
-    "Don't use markdown headers or bullet points unless asked. Be conversational.\n\n"
-    "You can also perform dashboard actions like promoting or demoting personnel — but only for authorized users (D2C and above). "
-    "When a user asks to promote or demote someone, extract the target's name and the new rank/class, then return ONLY a JSON object like:\n"
-    "{\"action\": \"promote\", \"target_name\": \"PlayerName\", \"new_rank_title\": \"RE | CDR 0-5\"}\n"
-    "or {\"action\": \"demote\", \"target_name\": \"PlayerName\", \"new_rank_title\": \"RE | LT 0-3\"}\n"
-    "ONLY return the raw JSON with no extra text if a dashboard action is needed. Otherwise just reply normally as text."
-)
+def base44_headers():
+    return {
+        "Content-Type": "application/json",
+        "x-api-key": BASE44_API_KEY
+    }
+
+async def get_all_ranks():
+    global _rank_cache
+    if _rank_cache:
+        return _rank_cache
+    async with aiohttp.ClientSession() as session:
+        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Rank/list"
+        async with session.post(url, json={}, headers=base44_headers()) as resp:
+            print(f"[RANKS] Status: {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                _rank_cache = data.get("records", [])
+                print(f"[RANKS] Loaded {len(_rank_cache)} ranks")
+                return _rank_cache
+    return []
+
+async def get_all_personnel():
+    global _personnel_cache
+    if _personnel_cache:
+        return _personnel_cache
+    async with aiohttp.ClientSession() as session:
+        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/list"
+        async with session.post(url, json={}, headers=base44_headers()) as resp:
+            print(f"[PERSONNEL] Status: {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                _personnel_cache = data.get("records", [])
+                print(f"[PERSONNEL] Loaded {len(_personnel_cache)} records")
+                return _personnel_cache
+    return []
+
+async def find_personnel_fuzzy(name: str):
+    records = await get_all_personnel()
+    name_lower = name.lower().strip()
+    # Exact
+    for r in records:
+        if r.get("name", "").lower() == name_lower:
+            return r
+    # Starts with
+    for r in records:
+        if r.get("name", "").lower().startswith(name_lower):
+            return r
+    # Contains
+    for r in records:
+        if name_lower in r.get("name", "").lower():
+            return r
+    return None
+
+async def find_rank_fuzzy(title: str):
+    records = await get_all_ranks()
+    title_lower = title.lower().strip()
+    # Exact
+    for r in records:
+        if r.get("title", "").lower() == title_lower:
+            return r
+    # Starts with
+    for r in records:
+        if r.get("title", "").lower().startswith(title_lower):
+            return r
+    # Contains
+    for r in records:
+        if title_lower in r.get("title", "").lower():
+            return r
+    return None
+
+async def get_rank_by_id(rank_id: str):
+    records = await get_all_ranks()
+    for r in records:
+        if r.get("id") == rank_id:
+            return r
+    return None
+
+async def build_rank_list_string():
+    ranks = await get_all_ranks()
+    if not ranks:
+        return "No ranks found."
+    sorted_ranks = sorted(ranks, key=lambda r: r.get("level", 0))
+    return "\n".join([f"- {r['title']} (level {r.get('level','?')})" for r in sorted_ranks])
+
+async def update_personnel_rank(personnel_id: str, new_rank_id: str, new_class_id: str) -> bool:
+    async with aiohttp.ClientSession() as session:
+        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/{personnel_id}"
+        async with session.put(url, json={"current_rank_id": new_rank_id, "current_class_id": new_class_id}, headers=base44_headers()) as resp:
+            print(f"[UPDATE] Personnel update status: {resp.status}")
+            return resp.status == 200
 
 def is_authorized(member: discord.Member) -> bool:
     return any(role.id in AUTHORIZED_ROLE_IDS for role in member.roles)
 
-async def ask_groq(history: list) -> str:
+async def ask_groq(history: list, extra_context: str = "") -> str:
+    rank_list = await build_rank_list_string()
+    system = (
+        "You are Jarvis, the AI assistant for the =GDRE= (Grand Duchy of the Royal Elite) War Thunder clan. "
+        "You are helpful, sharp, and have a casual friendly vibe. Keep replies concise — this is Discord, not an essay. "
+        "You know about the clan's structure: Enlisted, Officer, Command, Overseer, Superintendent, Directive, and Ownership classes. "
+        "Don't use markdown headers or bullet points unless asked. Be conversational.\n\n"
+        "You have LIVE access to the GDRE Dashboard. Here are the current ranks:\n"
+        f"{rank_list}\n\n"
+        "When a user asks to promote or demote someone, use ONLY rank titles from the list above. "
+        "Return ONLY a raw JSON object (no extra text, no code blocks) like:\n"
+        "{\"action\": \"promote\", \"target_name\": \"ExactNameFromDashboard\", \"new_rank_title\": \"EXACT TITLE FROM LIST\"}\n"
+        "If the user just wants to chat, reply normally as plain text."
+    )
+    if extra_context:
+        system += f"\n\nExtra context: {extra_context}"
+
     async with aiohttp.ClientSession() as session:
         payload = {
             "model": "llama-3.3-70b-versatile",
             "max_tokens": 400,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history
+            "messages": [{"role": "system", "content": system}] + history
         }
         async with session.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=15)
+            timeout=aiohttp.ClientTimeout(total=20)
         ) as resp:
             data = await resp.json()
             return data["choices"][0]["message"]["content"]
-
-async def find_personnel_fuzzy(name: str) -> dict | None:
-    """Fetch all personnel and find the closest name match (case-insensitive, partial)."""
-    async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/list"
-        async with session.post(url, json={}, headers={"Content-Type": "application/json"}) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            records = data.get("records", [])
-
-    name_lower = name.lower()
-
-    # 1st pass: exact match (case-insensitive)
-    for r in records:
-        if r.get("name", "").lower() == name_lower:
-            return r
-
-    # 2nd pass: starts with
-    for r in records:
-        if r.get("name", "").lower().startswith(name_lower):
-            return r
-
-    # 3rd pass: contains
-    for r in records:
-        if name_lower in r.get("name", "").lower():
-            return r
-
-    return None
-
-async def find_rank_fuzzy(title: str) -> dict | None:
-    """Fetch all ranks and find the closest title match (case-insensitive, partial)."""
-    async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Rank/list"
-        async with session.post(url, json={}, headers={"Content-Type": "application/json"}) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            records = data.get("records", [])
-
-    title_lower = title.lower()
-
-    # 1st pass: exact match
-    for r in records:
-        if r.get("title", "").lower() == title_lower:
-            return r
-
-    # 2nd pass: starts with
-    for r in records:
-        if r.get("title", "").lower().startswith(title_lower):
-            return r
-
-    # 3rd pass: contains
-    for r in records:
-        if title_lower in r.get("title", "").lower():
-            return r
-
-    return None
-
-async def update_personnel_rank(personnel_id: str, new_rank_id: str, new_class_id: str) -> bool:
-    async with aiohttp.ClientSession() as session:
-        url = f"{BASE44_API}/{GDRE_APP_ID}/entities/Personnel/{personnel_id}"
-        async with session.put(url, json={"current_rank_id": new_rank_id, "current_class_id": new_class_id}, headers={"Content-Type": "application/json"}) as resp:
-            return resp.status == 200
 
 async def handle_dashboard_action(action_data: dict, authorized: bool) -> str:
     if not authorized:
@@ -146,15 +181,26 @@ async def handle_dashboard_action(action_data: dict, authorized: bool) -> str:
 
     personnel = await find_personnel_fuzzy(target_name)
     if not personnel:
+        # Invalidate cache and retry
+        global _personnel_cache
+        _personnel_cache = None
+        personnel = await find_personnel_fuzzy(target_name)
+    if not personnel:
         return f"Couldn't find anyone matching **{target_name}** in the dashboard."
 
     new_rank = await find_rank_fuzzy(new_rank_title)
     if not new_rank:
-        return f"Couldn't find a rank matching **{new_rank_title}** in the dashboard."
+        global _rank_cache
+        _rank_cache = None
+        new_rank = await find_rank_fuzzy(new_rank_title)
+    if not new_rank:
+        return f"Couldn't find rank **{new_rank_title}** in the dashboard."
 
     success = await update_personnel_rank(personnel["id"], new_rank["id"], new_rank.get("class_id", ""))
 
     if success:
+        # Invalidate personnel cache so next lookup is fresh
+        _personnel_cache = None
         verb = "promoted" if action == "promote" else "demoted"
         return f"✅ **{personnel['name']}** has been {verb} to **{new_rank['title']}**."
     else:
@@ -163,6 +209,9 @@ async def handle_dashboard_action(action_data: dict, authorized: bool) -> str:
 @client.event
 async def on_ready():
     print(f"[BOOT] Logged in as {client.user}")
+    # Pre-load caches on startup
+    await get_all_ranks()
+    await get_all_personnel()
 
 @client.tree.command(name="jarvis", description="Start a conversation with Jarvis")
 async def jarvis(interaction: discord.Interaction):
@@ -215,12 +264,23 @@ async def on_message(message):
         async with message.channel.typing():
             try:
                 authorized = is_authorized(message.author) if isinstance(message.author, discord.Member) else False
-                session["history"].append({"role": "user", "content": content})
-                reply = await ask_groq(session["history"])
 
-                # Check if Groq returned a JSON action
+                # Build extra context: current rank of personnel if mentioned
+                extra_context = ""
+                personnel_all = await get_all_personnel()
+                for p in personnel_all:
+                    pname = p.get("name", "").lower()
+                    if pname and pname in content.lower():
+                        current_rank = await get_rank_by_id(p.get("current_rank_id", ""))
+                        if current_rank:
+                            extra_context = f"{p['name']}'s current rank is {current_rank['title']} (level {current_rank.get('level','?')})."
+                        break
+
+                session["history"].append({"role": "user", "content": content})
+                reply = await ask_groq(session["history"], extra_context)
+
+                # Strip code block if present
                 stripped = reply.strip()
-                # Handle code block wrapping
                 if stripped.startswith("```"):
                     stripped = stripped.strip("`").strip()
                     if stripped.startswith("json"):
@@ -243,7 +303,7 @@ async def on_message(message):
                 await message.channel.send("Had a hiccup, try again!")
         return
 
-    # Fallback: respond to @mentions outside sessions
+    # Fallback: @mentions outside sessions
     if client.user in message.mentions:
         content = message.content.replace(f"<@{BOT_ID}>", "").replace(f"<@!{BOT_ID}>", "").strip()
         if not content:
