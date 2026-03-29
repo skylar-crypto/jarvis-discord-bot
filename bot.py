@@ -358,6 +358,10 @@ async def ask_groq(history: list, extra_context: str = "") -> str:
 @client.event
 async def on_ready():
     print(f"[BOOT] Logged in as {client.user}")
+    await client.change_presence(
+        status=discord.Status.online,
+        activity=discord.Activity(type=discord.ActivityType.playing, name="Thinking...")
+    )
     await get_all_ranks()
     await get_all_personnel()
 
@@ -454,5 +458,6 @@ async def on_message(message):
                 await message.channel.send("Had trouble with that!")
 
 client.run(DISCORD_TOKEN)
+
 
 
