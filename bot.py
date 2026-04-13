@@ -285,15 +285,24 @@ async def send_channel_message(channel_name: str, message: str) -> str:
         return f"⚠️ Failed to send to **#{channel.name}**: {e}"
 
 async def send_dm_to_personnel(target_name: str, message: str) -> str:
-    """Send a DM to a personnel member by name."""
-    global _personnel_cache
-    _personnel_cache = None
-    personnel = await find_personnel_fuzzy(target_name)
-    if not personnel:
-        return f"⚠️ Couldn't find anyone matching **{target_name}**."
-    discord_user_id = personnel.get("employee_id")
-    if not discord_user_id:
-        return f"⚠️ No Discord ID on file for **{personnel['name']}**."
+    """Send a DM to a personnel member by name OR raw Discord user ID."""
+    
+    # If target_name is a raw Discord user ID (numeric), skip lookup entirely
+    target_clean = target_name.strip()
+    if target_clean.isdigit():
+        discord_user_id = target_clean
+        display_name = f"user {discord_user_id}"
+    else:
+        global _personnel_cache
+        _personnel_cache = None
+        personnel = await find_personnel_fuzzy(target_clean)
+        if not personnel:
+            return f"⚠️ Couldn't find anyone matching **{target_clean}**."
+        discord_user_id = personnel.get("employee_id")
+        display_name = personnel.get("name", target_clean)
+        if not discord_user_id:
+            return f"⚠️ No Discord ID on file for **{display_name}**."
+
     async with aiohttp.ClientSession() as session:
         # Open DM channel
         async with session.post(
@@ -304,7 +313,7 @@ async def send_dm_to_personnel(target_name: str, message: str) -> str:
             dm_channel = await resp.json()
             dm_channel_id = dm_channel.get("id")
         if not dm_channel_id:
-            return f"⚠️ Couldn't open DM channel with **{personnel['name']}**."
+            return f"⚠️ Couldn't open DM channel with **{display_name}**."
         # Send message
         async with session.post(
             f"https://discord.com/api/v10/channels/{dm_channel_id}/messages",
@@ -312,10 +321,10 @@ async def send_dm_to_personnel(target_name: str, message: str) -> str:
             headers=discord_headers()
         ) as resp:
             if resp.status == 200:
-                return f"✅ DM sent to **{personnel['name']}**."
+                return f"✅ DM sent to **{display_name}**."
             else:
                 body = await resp.text()
-                return f"⚠️ Failed to DM **{personnel['name']}**: {body}"
+                return f"⚠️ Failed to DM **{display_name}**: {body}"
 
 async def handle_dashboard_action(action_data: dict, authorized: bool, requester_name: str, guild_member=None) -> str:
     action = action_data.get("action")
@@ -490,6 +499,7 @@ async def on_message(message):
                 await message.channel.send("Had trouble with that!")
 
 client.run(DISCORD_TOKEN)
+
 
 
 
