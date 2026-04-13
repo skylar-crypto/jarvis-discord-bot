@@ -28,6 +28,7 @@ AUTHORIZED_ROLE_IDS = {
 }
 
 intents = discord.Intents.default()
+intents.members = True
 intents.message_content = True
 intents.members = True
 
@@ -83,15 +84,46 @@ async def get_all_personnel():
 async def find_personnel_fuzzy(name: str):
     records = await get_all_personnel()
     name_lower = name.lower().strip()
+
+    # 1. Exact match on dashboard name
     for r in records:
         if r.get("name", "").lower() == name_lower:
             return r
+    # 2. Starts-with match on dashboard name
     for r in records:
         if r.get("name", "").lower().startswith(name_lower):
             return r
+    # 3. Contains match on dashboard name
     for r in records:
         if name_lower in r.get("name", "").lower():
             return r
+
+    # 4. Fallback: search by Discord display name / username across ALL guild members
+    guild = client.get_guild(GUILD_ID)
+    if guild:
+        matched_member = None
+        for member in guild.members:
+            display = member.display_name.lower()
+            uname = member.name.lower()
+            if display == name_lower or uname == name_lower:
+                matched_member = member
+                break
+        if not matched_member:
+            for member in guild.members:
+                display = member.display_name.lower()
+                uname = member.name.lower()
+                if name_lower in display or name_lower in uname:
+                    matched_member = member
+                    break
+        if matched_member:
+            # Try to match this guild member to a dashboard record by employee_id
+            discord_id = str(matched_member.id)
+            for r in records:
+                if r.get("employee_id") == discord_id:
+                    return r
+            # No dashboard record found but member exists — return a minimal record so the bot knows who they are
+            return {"name": matched_member.display_name, "employee_id": discord_id, "_guild_only": True}
+
     return None
 
 async def get_rank_by_id(rank_id: str):
@@ -458,6 +490,7 @@ async def on_message(message):
                 await message.channel.send("Had trouble with that!")
 
 client.run(DISCORD_TOKEN)
+
 
 
 
